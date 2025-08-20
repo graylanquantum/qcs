@@ -52,6 +52,17 @@ from argon2.low_level import hash_secret_raw, Type as ArgonType
 from numpy.random import Generator, PCG64DXSM
 import itertools
 from datetime import timezone
+import asyncio
+import logging
+from coinbase.rest import RESTClient
+from coinbase import jwt_generator  # from coinbase-advanced-py
+
+CB_API_KEY = os.getenv("COINBASE_API_KEY")
+CB_API_SECRET = os.getenv("COINBASE_API_SECRET")
+
+CB_BASE = "https://api.coinbase.com"
+CB_EXCHANGE = "https://api.exchange.coinbase.com"
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -725,120 +736,24 @@ async def _get_json_async(url: str, params: Optional[dict] = None, headers: Opti
         return resp.json()
 
 
-async def fetch_eth_market_ticker() -> dict:
-    """
-    Find an ETH derivatives product on Coinbase (e.g., ETH-PERP) via 'search'
-    of the public product catalog, then fetch its live ticker. Falls back to spot ETH-USD.
-    Returns a dict with keys: product_id, price, bid, ask, time, source.
-    """
-    logger = logging.getLogger(__name__)
-    # 1) Try Coinbase Advanced Trade catalog for PERPETUAL products and find ETH
-    try:
-        catalog = await _get_json_async(
-            "https://api.coinbase.com/api/v3/brokerage/products",
-            params={"product_type": "PERPETUAL", "limit": 250},
-        )
-        products = catalog.get("products", []) if isinstance(catalog, dict) else []
-        eth_perps = [p for p in products if isinstance(p, dict) and "ETH" in str(p.get("product_id", "")).upper()]
-        if eth_perps:
-            pid = eth_perps[0].get("product_id", "ETH-PERP")
-            t = await _get_json_async(f"https://api.coinbase.com/api/v3/brokerage/products/{pid}/ticker")
-            price = t.get("price") or t.get("price_in_quote")
-            bid = t.get("bid_price") or t.get("best_bid")
-            ask = t.get("ask_price") or t.get("best_ask")
-            return {
-                "product_id": pid,
-                "price": float(price) if price else None,
-                "bid": float(bid) if bid else None,
-                "ask": float(ask) if ask else None,
-                "time": t.get("time") or t.get("ts") or t.get("trade_time"),
-                "source": "coinbase_advanced_trade_perp"
-            }
-    except Exception as e:
-        logger.debug(f"PERPETUAL catalog or ticker fetch failed, will try fallback. Reason: {e}")
 
-    # 2) Fallback: Coinbase Exchange legacy endpoint for ETH-PERP (if available)
+_cb = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET from env
+
+def _norm(x):
     try:
-        t = await _get_json_async("https://api.exchange.coinbase.com/products/ETH-PERP/ticker")
-        return {
-            "product_id": "ETH-PERP",
-            "price": float(t.get("price")) if t.get("price") else None,
-            "bid": float(t.get("bid")) if t.get("bid") else None,
-            "ask": float(t.get("ask")) if t.get("ask") else None,
-            "time": t.get("time"),
-            "source": "coinbase_exchange_perp"
-        }
+        return float(x) if x is not None else None
     except Exception:
-        pass
+        return None
 
-    # 3) Last resort: spot ETH-USD ticker (always widely available)
-    try:
-        # Prefer Advanced Trade spot ticker
-        t = await _get_json_async("https://api.coinbase.com/api/v3/brokerage/products/ETH-USD/ticker")
-        price = t.get("price") or t.get("price_in_quote")
-        bid = t.get("bid_price") or t.get("best_bid")
-        ask = t.get("ask_price") or t.get("best_ask")
-        return {
-            "product_id": "ETH-USD",
-            "price": float(price) if price else None,
-            "bid": float(bid) if bid else None,
-            "ask": float(ask) if ask else None,
-            "time": t.get("time") or t.get("ts") or t.get("trade_time"),
-            "source": "coinbase_advanced_trade_spot"
-        }
-    except Exception:
-        # Legacy spot fallback
-        t = await _get_json_async("https://api.exchange.coinbase.com/products/ETH-USD/ticker")
-        return {
-            "product_id": "ETH-USD",
-            "price": float(t.get("price")) if t.get("price") else None,
-            "bid": float(t.get("bid")) if t.get("bid") else None,
-            "ask": float(t.get("ask")) if t.get("ask") else None,
-            "time": t.get("time"),
-            "source": "coinbase_exchange_spot"
-        }
+async def _cb_get(path: str, params: Dict[str, Any] | None = None):
+    # RESTClient is sync; run it in a thread
+    return await asyncio.to_thread(_cb.get, path, params=params or {})
 
-
-def _format_eth_context(ticker: Optional[dict]) -> str:
-    """Make a compact market context line for the LLM prompt."""
-    if not ticker:
-        return "ETH market data: unavailable"
-    price = ticker.get("price")
-    bid = ticker.get("bid")
-    ask = ticker.get("ask")
-    pid = ticker.get("product_id", "ETH-?").upper()
-    src = ticker.get("source", "coinbase").replace("_", " ")
-    ts = ticker.get("time") or "n/a"
-    mid = None
-    try:
-        if bid is not None and ask is not None:
-            mid = (float(bid) + float(ask)) / 2.0
-    except Exception:
-        mid = None
-    parts = [f"{pid} @ ${price:.2f}" if isinstance(price, (int, float)) else f"{pid} @ n/a"]
-    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
-        parts.append(f"(bid ${bid:.2f} / ask ${ask:.2f}{f' / mid ${mid:.2f}' if mid is not None else ''})")
-    parts.append(f"source: {src}, time: {ts}")
-    return " ".join(parts)
-
-def collect_entropy(sources=None) -> int:
-    if sources is None:
-        sources = {
-            "os_random":
-            lambda: int.from_bytes(secrets.token_bytes(32), 'big'),
-            "system_metrics":
-            lambda: int(
-                hashlib.sha512(f"{os.getpid()}{os.getppid()}{time.time_ns()}".
-                               encode()).hexdigest(), 16),
-            "hardware_random":
-            lambda: int.from_bytes(os.urandom(32), 'big') ^ secrets.randbits(
-                256),
-        }
-    entropy_pool = [source() for source in sources.values()]
-    combined_entropy = hashlib.sha512("".join(map(
-        str, entropy_pool)).encode()).digest()
-    return int.from_bytes(combined_entropy, 'big') % 2**512
-
+async def _httpx_get_json(url: str, *, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 6.0):
+    async with httpx.AsyncClient(timeout=timeout, http2=True, headers={"Accept": "application/json", **(headers or {})}) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
 
 def fetch_entropy_logs():
     with sqlite3.connect(DB_FILE) as db:
@@ -1516,136 +1431,258 @@ async def phf_filter_input(input_text: str) -> tuple[bool, str]:
     return False, "PHF processing failed."
 
 
-def _coerce_float_or_none(v):
+
+# ---------------------------------------------------------------------------
+# Keep/replace your generic fetcher so other code paths still work with httpx
+# ---------------------------------------------------------------------------
+async def _get_json_async(
+    url: str,
+    *,
+    params: Dict[str, Any] | None = None,
+    headers: Dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> dict:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        http2=True,
+        headers={"Accept": "application/json", **(headers or {})},
+    ) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+# ---------------------------------------------------------------------------
+# Coinbase Advanced (REST JWT) helpers
+# ---------------------------------------------------------------------------
+def _build_cb_jwt(method: str, url_path: str) -> Optional[str]:
+    """Create a short-lived JWT for Advanced Trade REST (private endpoints)."""
+    if not (CB_API_KEY and CB_API_SECRET):
+        return None
+    jwt_uri = jwt_generator.format_jwt_uri(method.upper(), url_path)
+    return jwt_generator.build_rest_jwt(jwt_uri, CB_API_KEY, CB_API_SECRET)
+
+async def _cb_request_json(
+    method: str,
+    url_path: str,
+    *,
+    params: Dict[str, Any] | None = None,
+    allow_unauth: bool = False,
+    timeout: float = 10.0,
+) -> dict:
+    """
+    Call Advanced Trade REST.
+    - If allow_unauth=True, try no auth (public 'market' endpoints), then retry with JWT.
+    - Otherwise, sign with JWT (private endpoints).
+    """
+    url = f"{CB_BASE}{url_path}"
+    base_headers = {"Accept": "application/json"}
+
+    async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
+        attempts: List[Dict[str, str]] = []
+        if allow_unauth:
+            attempts.append(base_headers)  # unauth first
+        token = _build_cb_jwt(method, url_path)
+        if token:
+            attempts.append({**base_headers, "Authorization": f"Bearer {token}"})
+
+        last_exc = None
+        for hdrs in attempts:
+            try:
+                resp = await client.request(method.upper(), url, params=params or {}, headers=hdrs)
+                if resp.status_code == 401 and "Authorization" not in hdrs:
+                    # unauth failed; try auth next (if available)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+        if last_exc:
+            raise last_exc
+        return {}
+
+# ---------------------------------------------------------------------------
+# Product discovery (PERPETUAL first), then public ticker fetch
+# ---------------------------------------------------------------------------
+async def list_products_advanced(limit: int = 250, want_perps: bool = True) -> dict:
+    """
+    1) Private catalog: /api/v3/brokerage/products (JWT)
+    2) Public market:   /api/v3/brokerage/market/products (unauth -> auth)
+    """
+    params = {"limit": limit}
+    if want_perps:
+        params.update({"product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"})
+
+    # Private first
     try:
-        return parse_safe_float(v)
+        return await _cb_request_json("GET", "/api/v3/brokerage/products", params=params)
+    except httpx.HTTPStatusError as e:
+        logger.debug(f"Private products failed ({e.response.status_code}); trying public market products.")
+
+    # Public market fallback (may work without auth; will retry with JWT if 401)
+    return await _cb_request_json(
+        "GET", "/api/v3/brokerage/market/products", params=params, allow_unauth=True
+    )
+
+async def discover_best_product_id(asset_symbol: str, prefer: str = "PERPETUAL") -> Optional[str]:
+    """
+    Best-effort product_id discovery.
+    prefer:
+      - 'PERPETUAL' -> ETH-PERP-like first
+      - otherwise -> spot '-USD'
+    """
+    sym = asset_symbol.upper().strip()
+    if prefer.upper() == "PERPETUAL":
+        try:
+            cat = await list_products_advanced(limit=250, want_perps=True)
+            products = cat.get("products", []) if isinstance(cat, dict) else []
+            cands = [
+                p.get("product_id") for p in products
+                if isinstance(p, dict) and sym in str(p.get("product_id", "")).upper()
+            ]
+            if cands:
+                return cands[0]
+        except Exception as e:
+            logger.debug(f"discover perp failed: {e}")
+
+    # Spot fallback id (assumes USD quote)
+    return f"{sym}-USD"
+
+
+
+async def get_public_ticker(product_id: str) -> dict:
+    """
+    Public market snapshot for a product_id.
+    Path: /api/v3/brokerage/market/products/{product_id}/ticker
+    """
+    return await _cb_request_json(
+        "GET", f"/api/v3/brokerage/market/products/{product_id}/ticker", allow_unauth=True
+    )
+
+# ---------------------------------------------------------------------------
+# Market snapshot (PERP -> spot) with final Exchange fallback
+# ---------------------------------------------------------------------------
+def _f(x) -> Optional[float]:
+    try:
+        return float(x) if x is not None else None
     except Exception:
         return None
 
-def _now_unix():
-    return int(datetime.now(tz=timezone.utc).timestamp())
-
-async def list_products_advanced(product_type: str | None = None, limit: int = 250) -> dict:
-    params = {"limit": limit}
-    if product_type:
-        params["product_type"] = product_type
-    return await _get_json_async("https://api.coinbase.com/api/v3/brokerage/products", params=params)
-
-async def fetch_product_details(pid: str) -> dict:
-    return await _get_json_async(f"https://api.coinbase.com/api/v3/brokerage/products/{pid}")
-
-async def fetch_best_bid_ask_multi(product_ids: list[str]) -> dict:
-    ids = ",".join(product_ids)
-    return await _get_json_async("https://api.coinbase.com/api/v3/brokerage/best_bid_ask", params={"product_ids": ids})
-
-async def fetch_product_book(pid: str, level: str = "LEVEL1") -> dict:
-    return await _get_json_async(f"https://api.coinbase.com/api/v3/brokerage/products/{pid}/book", params={"level": level})
-
-async def fetch_product_candles(pid: str, start_unix: int | None = None, end_unix: int | None = None, granularity: str = "FIVE_MINUTE", limit: int = 120) -> dict:
-    end_unix = end_unix or _now_unix()
-    start_unix = start_unix or (end_unix - 10 * 60 * 60)
-    return await _get_json_async(f"https://api.coinbase.com/api/v3/brokerage/products/{pid}/candles", params={"start": str(start_unix), "end": str(end_unix), "granularity": granularity, "limit": limit})
-
-async def fetch_market_trades(pid: str, limit: int = 100) -> dict:
-    return await _get_json_async(f"https://api.coinbase.com/api/v3/brokerage/products/{pid}/ticker", params={"limit": limit})
-
-async def discover_best_product_id(asset_symbol: str, prefer: str = "PERPETUAL") -> str | None:
-    asset = asset_symbol.upper()
-    catalogue = await list_products_advanced(limit=250)
-    products = catalogue.get("products", []) if isinstance(catalogue, dict) else []
-    matches = [p for p in products if isinstance(p, dict) and str(p.get("product_id", "")).upper().startswith(asset + "-")]
-    if not matches:
-        return None
-    def pick(ptype: str):
-        for p in matches:
-            if str(p.get("product_type", "")).upper() == ptype:
-                return p.get("product_id")
-        return None
-    if prefer:
-        pid = pick(prefer.upper())
-        if pid:
-            return pid
-    for p in matches:
-        if str(p.get("quote_currency_id", "")).upper() == "USD":
-            return p.get("product_id")
-    return str(matches[0].get("product_id"))
-
-def _extract_product_metrics(product: dict) -> dict:
-    p = product.get("product") if isinstance(product, dict) and "product" in product else product or {}
-    perp = p.get("perpetual_details") or {}
-    return {
-        "mid_market_price": _coerce_float_or_none(p.get("mid_market_price")),
-        "price_pct_change_24h": _coerce_float_or_none(p.get("price_percentage_change_24h")),
-        "volume_24h": _coerce_float_or_none(p.get("volume_24h")),
-        "status": bleach.clean(str(p.get("status", ""))),
-        "funding_rate": _coerce_float_or_none(perp.get("funding_rate")),
-        "open_interest": _coerce_float_or_none(perp.get("open_interest")),
-    }
-
-def _compute_mid(bid: float | None, ask: float | None) -> float | None:
+def _norm_time(ts: Any) -> Optional[str]:
     try:
-        if bid is not None and ask is not None:
-            return (float(bid) + float(ask)) / 2.0
+        if ts is None:
+            return None
+        if isinstance(ts, (int, float)):
+            if ts > 10_000_000_000:  # ms -> s
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(float(ts), _tz.utc).isoformat()
+        if isinstance(ts, str):
+            return ts
     except Exception:
         pass
     return None
 
-def _format_snapshot_context(s: dict | None) -> str:
-    if not s:
-        return "Market: unavailable"
-    parts = [f"{s.get('product_id','?')} @ ${s.get('price','n/a')}"]
-    if s.get("bid") is not None and s.get("ask") is not None:
-        parts.append(f"(bid ${s['bid']} / ask ${s['ask']}{f' / mid ${s['mid']}' if s.get('mid') is not None else ''})")
-    if s.get("price_pct_change_24h") is not None:
-        parts.append(f"24h Δ {s['price_pct_change_24h']}%")
-    if s.get("volume_24h") is not None:
-        parts.append(f"vol24h {s['volume_24h']}")
-    if s.get("funding_rate") is not None:
-        parts.append(f"funding {s['funding_rate']}")
-    if s.get("open_interest") is not None:
-        parts.append(f"OI {s['open_interest']}")
-    parts.append(f"source: {s.get('source','coinbase')}, time: {s.get('time','n/a')}")
+
+
+async def fetch_eth_market_ticker() -> dict:
+    """
+    Prefer Advanced PERP; else Advanced spot; else Exchange spot.
+    Returns dict(product_id, price, bid, ask, time, source)
+    """
+    logger = logging.getLogger(__name__)
+
+    # 1) PERP discovery
+    pid = await discover_best_product_id("ETH", prefer="PERPETUAL")
+    if pid and pid.upper().endswith("PERP"):
+        try:
+            t = await get_public_ticker(pid)
+            price = t.get("price") or t.get("price_in_quote")
+            bid = t.get("best_bid")
+            ask = t.get("best_ask")
+            return {
+                "product_id": pid,
+                "price": _f(price),
+                "bid": _f(bid),
+                "ask": _f(ask),
+                "time": _norm_time(t.get("time") or t.get("ts")),
+                "source": "coinbase_advanced_market_public_perp",
+            }
+        except Exception as e:
+            logger.debug(f"perp ticker failed: {e}")
+
+    # 2) Advanced spot (public market)
+    try:
+        t = await get_public_ticker("ETH-USD")
+        price = t.get("price") or t.get("price_in_quote")
+        bid = t.get("best_bid")
+        ask = t.get("best_ask")
+        return {
+            "product_id": "ETH-USD",
+            "price": _f(price),
+            "bid": _f(bid),
+            "ask": _f(ask),
+            "time": _norm_time(t.get("time") or t.get("ts")),
+            "source": "coinbase_advanced_market_public_spot",
+        }
+    except Exception as e:
+        logger.debug(f"advanced spot failed: {e}")
+
+    # 3) Exchange spot (fully public, no keys)
+    try:
+        async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
+            r = await client.get(f"{CB_EXCHANGE}/products/ETH-USD/ticker", headers={"Accept": "application/json"})
+            r.raise_for_status()
+            j = r.json()
+        return {
+            "product_id": "ETH-USD",
+            "price": _f(j.get("price")),
+            "bid": _f(j.get("bid")),
+            "ask": _f(j.get("ask")),
+            "time": _norm_time(j.get("time")),
+            "source": "coinbase_exchange_public_spot",
+        }
+    except Exception as e:
+        logger.error(f"All fallbacks failed: {e}")
+        return {
+            "product_id": "ETH-?",
+            "price": None,
+            "bid": None,
+            "ask": None,
+            "time": None,
+            "source": "unavailable",
+        }
+
+# ---------------------------------------------------------------------------
+# Unchanged public helper: _format_eth_context
+# (now also works with dicts returned here)
+# ---------------------------------------------------------------------------
+def _format_eth_context(ticker: Optional[dict]) -> str:
+    """Make a compact market context line for the LLM prompt."""
+    if not ticker:
+        return "ETH market data: unavailable"
+    t = ticker.get("best", ticker) if isinstance(ticker, dict) else ticker
+
+    price = t.get("price")
+    bid = t.get("bid")
+    ask = t.get("ask")
+    pid = t.get("product_id", "ETH-?").upper()
+    src = t.get("source", "coinbase").replace("_", " ")
+    ts = t.get("time") or "n/a"
+
+    mid = None
+    try:
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
+            mid = (float(bid) + float(ask)) / 2.0
+    except Exception:
+        mid = None
+
+    parts = [f"{pid} @ ${price:.2f}" if isinstance(price, (int, float)) else f"{pid} @ n/a"]
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
+        parts.append(f"(bid ${bid:.2f} / ask ${ask:.2f}{f' / mid ${mid:.2f}' if mid is not None else ''})")
+    parts.append(f"source: {src}, time: {ts}")
     return " ".join(parts)
 
-async def fetch_asset_snapshot(asset_symbol: str, prefer: str = "PERPETUAL") -> dict | None:
-    pid = await discover_best_product_id(asset_symbol, prefer=prefer)
-    if not pid:
-        return None
-    details = await fetch_product_details(pid)
-    metrics = _extract_product_metrics(details)
-    bba = await fetch_best_bid_ask_multi([pid])
-    bba_row = None
-    if isinstance(bba, dict):
-        rows = bba.get("pricebooks") or bba.get("best_bid_ask", [])
-        if isinstance(rows, list) and rows:
-            bba_row = rows[0]
-    best_bid = _coerce_float_or_none((bba_row or {}).get("best_bid") or (bba_row or {}).get("bid_price"))
-    best_ask = _coerce_float_or_none((bba_row or {}).get("best_ask") or (bba_row or {}).get("ask_price"))
-    trades = await fetch_market_trades(pid, limit=1)
-    last_price = None
-    if isinstance(trades, dict):
-        if isinstance(trades.get("trades"), list) and trades["trades"]:
-            last_price = _coerce_float_or_none(trades["trades"][0].get("price"))
-        if last_price is None:
-            last_price = _coerce_float_or_none(trades.get("price"))
-    mid = _compute_mid(best_bid, best_ask) or metrics.get("mid_market_price")
-    def _fmt(x):
-        return f"{float(x):.2f}" if isinstance(x, (int, float)) else None
-    snap = {
-        "asset": asset_symbol.upper(),
-        "product_id": pid,
-        "source": "coinbase_advanced_trade",
-        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "price": _fmt(last_price or metrics.get("mid_market_price")),
-        "bid": _fmt(best_bid),
-        "ask": _fmt(best_ask),
-        "mid": _fmt(mid),
-        "price_pct_change_24h": _fmt(metrics.get("price_pct_change_24h")),
-        "volume_24h": _fmt(metrics.get("volume_24h")),
-        "funding_rate": _fmt(metrics.get("funding_rate")),
-        "open_interest": _fmt(metrics.get("open_interest")),
-    }
-    return snap
+
+
 
 async def scan_debris_for_route(
     lat: float,
@@ -1656,38 +1693,129 @@ async def scan_debris_for_route(
     selected_model: str | None = None
 ) -> tuple[str, str, str, str, str, str]:
     model_used = selected_model or "OpenAI"
+
+    # ----------------------- small http helpers (http/1.1) -------------------
+    async def _http_get_json(url: str, *, params: Dict[str, Any] | None = None, timeout: float = 8.0) -> dict:
+        async with httpx.AsyncClient(timeout=timeout, http2=False, headers={"Accept": "application/json"}) as c:
+            r = await c.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+
+    async def _exchange_ticker(pid: str) -> Optional[dict]:
+        """Coinbase Exchange public ticker (no key)."""
+        try:
+            j = await _http_get_json(f"https://api.exchange.coinbase.com/products/{pid}/ticker")
+            return {
+                "product_id": pid,
+                "price": float(j.get("price")) if j.get("price") else None,
+                "bid": float(j.get("bid")) if j.get("bid") else None,
+                "ask": float(j.get("ask")) if j.get("ask") else None,
+                "time": j.get("time"),
+                "source": "coinbase_exchange_public",
+            }
+        except Exception as e:
+            logger.debug(f"Exchange ticker {pid} failed: {e}")
+            return None
+
+    async def _intx_perp_metrics(instrument: str = "ETH-PERP") -> Optional[dict]:
+        """
+        Coinbase International Exchange (INTX) REST: OI + predicted funding.
+        Tries /instruments/{instrument}, then /instruments list.
+        """
+        base = "https://api.international.coinbase.com/api/v1"
+        try_names = [instrument, "ETH-USDC"] if instrument.upper().startswith("ETH") else [instrument]
+        try:
+            # 1) direct instrument details
+            for name in try_names:
+                try:
+                    j = await _http_get_json(f"{base}/instruments/{name}")
+                    q = j.get("quote") or {}
+                    return {
+                        "instrument": j.get("symbol") or name,
+                        "oi": j.get("open_interest"),
+                        "predicted_funding": q.get("predicted_funding"),
+                        "mark_price": q.get("mark_price"),
+                        "index_price": q.get("index_price"),
+                        "ts": q.get("timestamp"),
+                        "source": "coinbase_intx_rest_instrument",
+                    }
+                except Exception:
+                    pass
+            # 2) list + filter
+            items = await _http_get_json(f"{base}/instruments")
+            if isinstance(items, list):
+                for it in items:
+                    if (it.get("symbol") in ("ETH-USDC", "ETH-PERP")) and it.get("type") == "PERP":
+                        q = it.get("quote") or {}
+                        return {
+                            "instrument": it.get("symbol"),
+                            "oi": it.get("open_interest"),
+                            "predicted_funding": q.get("predicted_funding"),
+                            "mark_price": q.get("mark_price"),
+                            "index_price": q.get("index_price"),
+                            "ts": q.get("timestamp"),
+                            "source": "coinbase_intx_rest_list_instruments",
+                        }
+        except Exception as e:
+            logger.debug(f"INTX metrics failed: {e}")
+        return None
+
+    # ----------------------- system / env context ----------------------------
     try:
         cpu_usage, ram_usage = get_cpu_ram_usage()
     except Exception:
         cpu_usage, ram_usage = 0.0, 0.0
+
     try:
         quantum_results = quantum_hazard_scan(cpu_usage, ram_usage)
     except Exception:
         quantum_results = "Scan Failed"
+
     try:
         street_name = await fetch_street_name_llm(lat, lon)
     except Exception:
         street_name = "Unknown Location"
+
+    # ----------------------- market report: ETH + ADA + OI -------------------
+    market_lines: list[str] = []
+
+    # ETH ticker (prefer your helper if present; else Exchange spot)
+    eth_ticker: Optional[dict] = None
     try:
-        eth_snap = await fetch_asset_snapshot("ETH", prefer="PERPETUAL")
-        ada_snap = await fetch_asset_snapshot("ADA", prefer="PERPETUAL")
-    except Exception as e:
-        logger.error(f"Asset snapshot fetch error: {e}", exc_info=True)
-        eth_snap, ada_snap = None, None
-    market_lines = []
-    if eth_snap:
-        market_lines.append(_format_snapshot_context(eth_snap))
-    else:
-        try:
+        # If earlier helper exists, use it
+        if "fetch_eth_market_ticker" in globals():
             eth_ticker = await fetch_eth_market_ticker()
-            market_lines.append(_format_eth_context(eth_ticker))
-        except Exception:
-            market_lines.append("ETH market data: unavailable")
-    if ada_snap:
-        market_lines.append(_format_snapshot_context(ada_snap))
+    except Exception as e:
+        logger.debug(f"fetch_eth_market_ticker failed: {e}")
+
+    if not eth_ticker:
+        eth_ticker = await _exchange_ticker("ETH-USD")
+
+    market_lines.append(_format_eth_context(eth_ticker) if eth_ticker else "ETH market data: unavailable")
+
+    # ADA ticker (Exchange spot)
+    ada_ticker = await _exchange_ticker("ADA-USD")
+    if ada_ticker:
+        market_lines.append(_format_eth_context(ada_ticker))  # formatter is generic
+
+    # ETH-PERP OI & funding from INTX
+    eth_perp = await _intx_perp_metrics("ETH-PERP")
+    if eth_perp:
+        oi = eth_perp.get("oi")
+        pf = eth_perp.get("predicted_funding")
+        mark = eth_perp.get("mark_price")
+        ts = eth_perp.get("ts") or "n/a"
+        market_lines.append(
+            f"ETH-PERP (INTX): OI={oi} contracts, funding={pf}, mark={mark}, time={ts}, source={eth_perp.get('source')}"
+        )
+
     market_report_block = "\n".join(market_lines)
-    eth_json = json.dumps(eth_snap or {}, ensure_ascii=False)
-    ada_json = json.dumps(ada_snap or {}, ensure_ascii=False)
+
+    # snapshots removed
+    eth_json = "{}"
+    ada_json = "{}"
+
+    # ----------------------- LLM prompt -------------------------------------
     openai_prompt = f"""
 [action]
 NOSONAR Hypertime Quantum Nanobot Trade Prediction Engine. Fuse the outputs of eight specialized agents to form a probabilistic market consensus for leveraged and spot strategies. 
@@ -1788,6 +1916,7 @@ Consensus: <STATE> conf=<CONF_CONS> size=<SIZE_CONS>% P=[<PS_CONS>,<PN_CONS>,<PL
 Execution: entry <ENTRY>, stop <STOP>, invalidation <INVALIDATION>
 [/replyexample]
 """.strip()
+
     raw_report: Optional[str] = await run_openai_completion(openai_prompt)
     report: str = raw_report if raw_report is not None else "OpenAI failed to respond."
     report = report.strip()
