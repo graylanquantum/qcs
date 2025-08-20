@@ -55,7 +55,7 @@ from datetime import timezone
 import asyncio
 import logging
 from coinbase.rest import RESTClient
-from coinbase import jwt_generator  # from coinbase-advanced-py
+from coinbase import jwt_generator
 
 CB_API_KEY = os.getenv("COINBASE_API_KEY")
 CB_API_SECRET = os.getenv("COINBASE_API_SECRET")
@@ -737,7 +737,7 @@ async def _get_json_async(url: str, params: Optional[dict] = None, headers: Opti
 
 
 
-_cb = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET from env
+_cb = RESTClient()  
 
 def _norm(x):
     try:
@@ -746,7 +746,7 @@ def _norm(x):
         return None
 
 async def _cb_get(path: str, params: Dict[str, Any] | None = None):
-    # RESTClient is sync; run it in a thread
+
     return await asyncio.to_thread(_cb.get, path, params=params or {})
 
 async def _httpx_get_json(url: str, *, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 6.0):
@@ -1431,10 +1431,6 @@ async def phf_filter_input(input_text: str) -> tuple[bool, str]:
     return False, "PHF processing failed."
 
 
-
-# ---------------------------------------------------------------------------
-# Keep/replace your generic fetcher so other code paths still work with httpx
-# ---------------------------------------------------------------------------
 async def _get_json_async(
     url: str,
     *,
@@ -1451,11 +1447,8 @@ async def _get_json_async(
         r.raise_for_status()
         return r.json()
 
-# ---------------------------------------------------------------------------
-# Coinbase Advanced (REST JWT) helpers
-# ---------------------------------------------------------------------------
 def _build_cb_jwt(method: str, url_path: str) -> Optional[str]:
-    """Create a short-lived JWT for Advanced Trade REST (private endpoints)."""
+  
     if not (CB_API_KEY and CB_API_SECRET):
         return None
     jwt_uri = jwt_generator.format_jwt_uri(method.upper(), url_path)
@@ -1469,18 +1462,14 @@ async def _cb_request_json(
     allow_unauth: bool = False,
     timeout: float = 10.0,
 ) -> dict:
-    """
-    Call Advanced Trade REST.
-    - If allow_unauth=True, try no auth (public 'market' endpoints), then retry with JWT.
-    - Otherwise, sign with JWT (private endpoints).
-    """
+
     url = f"{CB_BASE}{url_path}"
     base_headers = {"Accept": "application/json"}
 
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         attempts: List[Dict[str, str]] = []
         if allow_unauth:
-            attempts.append(base_headers)  # unauth first
+            attempts.append(base_headers)  
         token = _build_cb_jwt(method, url_path)
         if token:
             attempts.append({**base_headers, "Authorization": f"Bearer {token}"})
@@ -1490,7 +1479,7 @@ async def _cb_request_json(
             try:
                 resp = await client.request(method.upper(), url, params=params or {}, headers=hdrs)
                 if resp.status_code == 401 and "Authorization" not in hdrs:
-                    # unauth failed; try auth next (if available)
+       
                     continue
                 resp.raise_for_status()
                 return resp.json()
@@ -1500,9 +1489,7 @@ async def _cb_request_json(
             raise last_exc
         return {}
 
-# ---------------------------------------------------------------------------
-# Product discovery (PERPETUAL first), then public ticker fetch
-# ---------------------------------------------------------------------------
+
 async def list_products_advanced(limit: int = 250, want_perps: bool = True) -> dict:
     """
     1) Private catalog: /api/v3/brokerage/products (JWT)
@@ -1512,24 +1499,18 @@ async def list_products_advanced(limit: int = 250, want_perps: bool = True) -> d
     if want_perps:
         params.update({"product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"})
 
-    # Private first
+
     try:
         return await _cb_request_json("GET", "/api/v3/brokerage/products", params=params)
     except httpx.HTTPStatusError as e:
         logger.debug(f"Private products failed ({e.response.status_code}); trying public market products.")
 
-    # Public market fallback (may work without auth; will retry with JWT if 401)
     return await _cb_request_json(
         "GET", "/api/v3/brokerage/market/products", params=params, allow_unauth=True
     )
 
 async def discover_best_product_id(asset_symbol: str, prefer: str = "PERPETUAL") -> Optional[str]:
-    """
-    Best-effort product_id discovery.
-    prefer:
-      - 'PERPETUAL' -> ETH-PERP-like first
-      - otherwise -> spot '-USD'
-    """
+
     sym = asset_symbol.upper().strip()
     if prefer.upper() == "PERPETUAL":
         try:
@@ -1544,23 +1525,17 @@ async def discover_best_product_id(asset_symbol: str, prefer: str = "PERPETUAL")
         except Exception as e:
             logger.debug(f"discover perp failed: {e}")
 
-    # Spot fallback id (assumes USD quote)
+
     return f"{sym}-USD"
 
 
 
 async def get_public_ticker(product_id: str) -> dict:
-    """
-    Public market snapshot for a product_id.
-    Path: /api/v3/brokerage/market/products/{product_id}/ticker
-    """
+
     return await _cb_request_json(
         "GET", f"/api/v3/brokerage/market/products/{product_id}/ticker", allow_unauth=True
     )
 
-# ---------------------------------------------------------------------------
-# Market snapshot (PERP -> spot) with final Exchange fallback
-# ---------------------------------------------------------------------------
 def _f(x) -> Optional[float]:
     try:
         return float(x) if x is not None else None
@@ -1572,7 +1547,7 @@ def _norm_time(ts: Any) -> Optional[str]:
         if ts is None:
             return None
         if isinstance(ts, (int, float)):
-            if ts > 10_000_000_000:  # ms -> s
+            if ts > 10_000_000_000:
                 ts = ts / 1000.0
             return datetime.fromtimestamp(float(ts), _tz.utc).isoformat()
         if isinstance(ts, str):
@@ -1584,13 +1559,9 @@ def _norm_time(ts: Any) -> Optional[str]:
 
 
 async def fetch_eth_market_ticker() -> dict:
-    """
-    Prefer Advanced PERP; else Advanced spot; else Exchange spot.
-    Returns dict(product_id, price, bid, ask, time, source)
-    """
+
     logger = logging.getLogger(__name__)
 
-    # 1) PERP discovery
     pid = await discover_best_product_id("ETH", prefer="PERPETUAL")
     if pid and pid.upper().endswith("PERP"):
         try:
@@ -1609,7 +1580,7 @@ async def fetch_eth_market_ticker() -> dict:
         except Exception as e:
             logger.debug(f"perp ticker failed: {e}")
 
-    # 2) Advanced spot (public market)
+
     try:
         t = await get_public_ticker("ETH-USD")
         price = t.get("price") or t.get("price_in_quote")
@@ -1626,7 +1597,7 @@ async def fetch_eth_market_ticker() -> dict:
     except Exception as e:
         logger.debug(f"advanced spot failed: {e}")
 
-    # 3) Exchange spot (fully public, no keys)
+
     try:
         async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
             r = await client.get(f"{CB_EXCHANGE}/products/ETH-USD/ticker", headers={"Accept": "application/json"})
@@ -1651,12 +1622,8 @@ async def fetch_eth_market_ticker() -> dict:
             "source": "unavailable",
         }
 
-# ---------------------------------------------------------------------------
-# Unchanged public helper: _format_eth_context
-# (now also works with dicts returned here)
-# ---------------------------------------------------------------------------
 def _format_eth_context(ticker: Optional[dict]) -> str:
-    """Make a compact market context line for the LLM prompt."""
+
     if not ticker:
         return "ETH market data: unavailable"
     t = ticker.get("best", ticker) if isinstance(ticker, dict) else ticker
@@ -1694,7 +1661,7 @@ async def scan_debris_for_route(
 ) -> tuple[str, str, str, str, str, str]:
     model_used = selected_model or "OpenAI"
 
-    # ----------------------- small http helpers (http/1.1) -------------------
+    
     async def _http_get_json(url: str, *, params: Dict[str, Any] | None = None, timeout: float = 8.0) -> dict:
         async with httpx.AsyncClient(timeout=timeout, http2=False, headers={"Accept": "application/json"}) as c:
             r = await c.get(url, params=params)
@@ -1702,7 +1669,7 @@ async def scan_debris_for_route(
             return r.json()
 
     async def _exchange_ticker(pid: str) -> Optional[dict]:
-        """Coinbase Exchange public ticker (no key)."""
+        
         try:
             j = await _http_get_json(f"https://api.exchange.coinbase.com/products/{pid}/ticker")
             return {
@@ -1725,7 +1692,7 @@ async def scan_debris_for_route(
         base = "https://api.international.coinbase.com/api/v1"
         try_names = [instrument, "ETH-USDC"] if instrument.upper().startswith("ETH") else [instrument]
         try:
-            # 1) direct instrument details
+           
             for name in try_names:
                 try:
                     j = await _http_get_json(f"{base}/instruments/{name}")
@@ -1741,7 +1708,7 @@ async def scan_debris_for_route(
                     }
                 except Exception:
                     pass
-            # 2) list + filter
+           
             items = await _http_get_json(f"{base}/instruments")
             if isinstance(items, list):
                 for it in items:
@@ -1760,7 +1727,7 @@ async def scan_debris_for_route(
             logger.debug(f"INTX metrics failed: {e}")
         return None
 
-    # ----------------------- system / env context ----------------------------
+    
     try:
         cpu_usage, ram_usage = get_cpu_ram_usage()
     except Exception:
@@ -1776,13 +1743,13 @@ async def scan_debris_for_route(
     except Exception:
         street_name = "Unknown Location"
 
-    # ----------------------- market report: ETH + ADA + OI -------------------
+    
     market_lines: list[str] = []
 
-    # ETH ticker (prefer your helper if present; else Exchange spot)
+   
     eth_ticker: Optional[dict] = None
     try:
-        # If earlier helper exists, use it
+  
         if "fetch_eth_market_ticker" in globals():
             eth_ticker = await fetch_eth_market_ticker()
     except Exception as e:
@@ -1793,12 +1760,12 @@ async def scan_debris_for_route(
 
     market_lines.append(_format_eth_context(eth_ticker) if eth_ticker else "ETH market data: unavailable")
 
-    # ADA ticker (Exchange spot)
+    
     ada_ticker = await _exchange_ticker("ADA-USD")
     if ada_ticker:
-        market_lines.append(_format_eth_context(ada_ticker))  # formatter is generic
+        market_lines.append(_format_eth_context(ada_ticker))  
 
-    # ETH-PERP OI & funding from INTX
+
     eth_perp = await _intx_perp_metrics("ETH-PERP")
     if eth_perp:
         oi = eth_perp.get("oi")
@@ -1811,11 +1778,11 @@ async def scan_debris_for_route(
 
     market_report_block = "\n".join(market_lines)
 
-    # snapshots removed
+  
     eth_json = "{}"
     ada_json = "{}"
 
-    # ----------------------- LLM prompt -------------------------------------
+   
     openai_prompt = f"""
 [action]
 NOSONAR Hypertime Quantum Nanobot Trade Prediction Engine. Fuse the outputs of eight specialized agents to form a probabilistic market consensus for leveraged and spot strategies. 
